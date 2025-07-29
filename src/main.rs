@@ -1,341 +1,322 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
-#![feature(windows_process_extensions_show_window)]
+use std::fs::{File, remove_dir_all, copy, create_dir_all};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::os::windows::process::CommandExt;
+use std::str::FromStr;
 
-mod winfunc;
-mod lenlogo;
-mod esp_partition;
+use sha2::{Digest, Sha256};
+use efivar::efi::{Variable, VariableFlags};
+use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::System::Threading::*;
+use windows_sys::Win32::Security::*;
 
-use egui::FontId;
-use egui::RichText;
-use eframe::egui;
-use eframe::egui::Color32;
-use eframe::epaint::text::FontData;
-use egui::FontFamily::Proportional;
-use egui::TextStyle::{Body, Button, Heading, Monospace, Small};
-use lenlogo::PlatformInfo;
+pub fn is_admin() -> bool {
+    unsafe {
+        let mut token_handle: HANDLE = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle) == 0 {
+            eprintln!("OpenProcessToken failed");
+            return false;
+        }
 
-fn main() -> Result<(), eframe::Error> {
-    let icon = include_bytes!("../assets/icon.png");
+        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut size: u32 = 0;
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 420.0])
-            .with_min_inner_size([600.0, 420.0])
-            .with_icon(eframe::icon_data::from_png_bytes(icon).unwrap()),
-        ..Default::default()
+        let success = GetTokenInformation(
+            token_handle,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        );
+
+        CloseHandle(token_handle);
+
+        if success == 0 {
+            eprintln!("GetTokenInformation failed");
+            return false;
+        }
+
+        elevation.TokenIsElevated != 0
+    }
+}
+
+fn find_available_drive() -> Option<char> {
+    let drive_mask = unsafe { GetLogicalDrives() };
+    for drive_letter in b'A'..=b'Z' {
+        let mask = 1 << (drive_letter - b'A');
+        if (drive_mask & mask) == 0 {
+            return Some(drive_letter as char);
+        }
+    }
+    None
+}
+
+fn mountvol_mount(drive_letter: char) -> bool {
+    let mut cmd = Command::new("mountvol");
+    let status = cmd.arg(format!("{}:", drive_letter))
+        .arg("/s")
+        .show_window(0u16)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
+fn mountvol_unmount(drive_letter: char) -> bool {
+    let mut cmd = Command::new("mountvol");
+    let status = cmd.arg(format!("{}:", drive_letter))
+        .arg("/d")
+        .show_window(0u16)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
+fn delete_logo_path() -> bool {
+    let drive_letter = match find_available_drive() {
+        Some(d) => d,
+        None => return false,
     };
-    eframe::run_native(
-        "Lenovo UEFI Boot Logo Changer",
-        options,
-        Box::new(|cc| Ok(Box::new(MyApp::new(cc))))
-    )
-}
+    if !mountvol_mount(drive_letter) {
+        return false;
+    }
 
-#[derive(Default)]
-struct MyApp {
-    language: String,
-    is_admin:bool,
-    is_support:bool,
-    is_loading_icon: bool,
-    platform_info: PlatformInfo,
-    last_set_logo:i8,
-    last_restore_logo:i8,
-    set_loading_icon: bool,
-    picked_path: Option<String>,
-}
-
-impl eframe::App for MyApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.is_admin {
-            self.show_main_ui(ctx);
-        }
-        else {
-            self.show_admin_prompt_ui(ctx);
+    let target_path = Path::new(&format!("{}:\\EFI\\Lenovo\\Logo", drive_letter));
+    if target_path.exists() {
+        if let Err(e) = remove_dir_all(target_path) {
+            eprintln!("Failed to remove logo path: {}", e);
+            mountvol_unmount(drive_letter);
+            return false;
         }
     }
+    mountvol_unmount(drive_letter);
+    true
 }
 
-impl MyApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        println!("Start MyApp::new");
-        setup_custom_fonts(&cc.egui_ctx);
-        let is_admin = winfunc::is_admin();
-        let mut platform_info = PlatformInfo::default();
-        let mut is_support = false;
-        if is_admin {
-            is_support = platform_info.get_info();
+fn copy_file_to_esp(src: &str, dst: &str) -> bool {
+    let src_path = Path::new(src);
+    if !src_path.is_file() {
+        eprintln!("Source is not file");
+        return false;
+    }
+
+    let drive_letter = match find_available_drive() {
+        Some(d) => d,
+        None => return false,
+    };
+    if !mountvol_mount(drive_letter) {
+        return false;
+    }
+
+    let target_path = Path::new(&format!("{}:\\", drive_letter)).join(dst);
+    if let Some(parent) = target_path.parent() {
+        if parent.exists() {
+            let _ = remove_dir_all(parent);
         }
-        let language = String::from("en");
-        let is_loading_icon = platform_info.get_loading_icon();
-        let set_loading_icon = is_loading_icon;
-        
+        if let Err(e) = create_dir_all(parent) {
+            eprintln!("Failed to create target dir: {}", e);
+            mountvol_unmount(drive_letter);
+            return false;
+        }
+    }
+
+    if let Err(e) = copy(src, &target_path) {
+        eprintln!("Copy file failed: {}", e);
+        mountvol_unmount(drive_letter);
+        return false;
+    }
+
+    mountvol_unmount(drive_letter);
+    true
+}
+
+fn calculate_sha256(file_path: &str) -> io::Result<String> {
+    let mut file = File::open(file_path)?;
+    let mut sha256 = Sha256::new();
+    let mut buffer = [0; 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        sha256.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", sha256.finalize()))
+}
+
+pub struct PlatformInfo {
+    pub enable: u8,
+    pub width: u32,
+    pub height: u32,
+    pub version: u32,
+    pub support: Vec<&'static str>,
+    pub lbldesp_var: [u8; 10],
+    pub lbldvc_var: [u8; 40],
+}
+
+impl Default for PlatformInfo {
+    fn default() -> Self {
         Self {
-            language,
-            is_admin,
-            is_support,
-            is_loading_icon,
-            set_loading_icon,
-            platform_info,
-            ..Default::default()
+            enable: 0,
+            width: 0,
+            height: 0,
+            version: 0,
+            support: vec![],
+            lbldesp_var: [0; 10],
+            lbldvc_var: [0; 40],
         }
     }
-
-    fn show_main_ui(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Language : ");
-                ui.radio_value(&mut self.language, String::from("en"), "English");
-                ui.radio_value(&mut self.language, String::from("zh"), "中文");
-            });
-            ui.separator();
-
-            if self.is_support {
-
-                ui.colored_label(Color32::LIGHT_GREEN, if self.language == "zh" {
-                    "您的设备是支持的！"
-                }
-                else {
-                    "Your device is supported !"
-                });
-
-                ui.separator();
-                if self.platform_info.enable != 0 {
-                    ui.colored_label(Color32::LIGHT_GREEN, if self.language == "zh" {
-                        "自定义UEFI Logo已启用"
-                    }
-                    else {
-                        "UEFI Logo DIY Enabled"
-                    });
-                }
-                else {
-                    ui.colored_label(Color32::LIGHT_RED, if self.language == "zh" {
-                        "自定义UEFI Logo未启用"
-                    }
-                    else {
-                        "UEFI Logo DIY Disabled"
-                    });
-                }
-
-                ui.label(format!("{} : {}x{}", if self.language == "zh" {
-                    "图片最大分辨率"
-                }
-                else {
-                    "Max Image Size"
-                }, self.platform_info.width, self.platform_info.height));
-                // ui.label(format!("Support Format / 支持的图片格式 : {}", self.platform_info.support.join(" / ")));
-                ui.label(format!("{} : {}", if self.language == "zh" {
-                    "支持的图片格式"
-                }
-                else {
-                    "Support Format"
-                }, self.platform_info.support.join(" / ")));
-                ui.label(format!("{} : {:x}", if self.language == "zh" {
-                    "协议版本"
-                }
-                else {
-                    "Version"
-                },self.platform_info.version));
-
-                ui.separator();
-
-                if !self.platform_info.support.is_empty() {
-                    ui.checkbox(&mut self.set_loading_icon, if self.language == "zh" {
-                        "显示Windows加载图标"
-                    }
-                    else {
-                        "show Windows loading circle"
-                    });
-                    if ui.button(if self.language == "zh" {
-                        "选择图片"
-                    }
-                    else {
-                        "Pick Image"
-                    }).clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Image", &*self.platform_info.support)
-                            .pick_file() {
-                            self.picked_path = Some(path.display().to_string());
-                        }
-                    }
-                }
-
-                if let Some(picked_path) = &self.picked_path  {
-                    if self.platform_info.version == 0x20003 {
-                        ui.horizontal(|ui| {
-                            ui.label(if self.language == "zh" {
-                                "已选择的图片："
-                            }
-                            else {
-                                "Picked Image: "
-                            });
-                            ui.monospace(picked_path);
-                        });
-                        /*
-                        ui.colored_label(Color32::LIGHT_RED, if self.language == "zh" {
-                            "请最后确认分辨率和上传的图片格式！"
-                        }
-                        else {
-                            "Please confirm the SIZE and FORMAT of the uploaded images!"
-                        });
-                        */
-                        if ui.button(RichText::new(if self.language == "zh" {
-                            "!!! 设置Logo !!! "
-                        }
-                        else {
-                            "!!! Change Logo !!!"
-                        }).color(Color32::RED)).clicked() {
-                            self.last_restore_logo = 0;
-                            self.last_set_logo = 0;
-                            self.platform_info.set_loading_icon(self.set_loading_icon);
-                            self.is_loading_icon = self.platform_info.get_loading_icon();
-                            if self.is_loading_icon == self.set_loading_icon {
-                                println!("Loading icon Change Success!");
-                            }
-                            else {
-                                eprintln!("Loading icon Change Fail!");
-                            }
-                            self.set_loading_icon = self.is_loading_icon;
-
-                            if self.platform_info.set_logo(picked_path) {
-                                self.last_set_logo = 1;
-                                println!("Change Logo Success !")
-                            }
-                            else {
-                                self.last_set_logo = -1;
-                                println!("Change Logo Failed !")
-                            }
-                        }
-                    }
-                }
-
-                match self.last_set_logo {
-                    1 => {
-                        ui.colored_label(Color32::LIGHT_GREEN, if self.language == "zh" {
-                            "设置Logo成功，重新启动以查看效果"
-                        }
-                        else {
-                            "Change logo succeed, reboot to see the effect"
-                        });
-                    },
-                    -1 => {
-                        ui.colored_label(Color32::LIGHT_RED, if self.language == "zh" {
-                            "设置Logo失败"
-                        }
-                        else {
-                            "Change logo failed"
-                        });
-                    },
-                    _ => {}
-                }
-
-                ui.separator();
-                if ui.button(if self.language == "zh" {
-                    "恢复Logo"
-                }
-                else {
-                    "Restore Logo"
-                }).clicked() {
-                    self.last_restore_logo = 0;
-                    self.last_set_logo = 0;
-
-                    self.platform_info.set_loading_icon(true);
-                    self.is_loading_icon = self.platform_info.get_loading_icon();
-                    if self.is_loading_icon {
-                        print!("Restore Loading icon Success!");
-                    }
-                    else {
-                        eprintln!("Restore Loading icon Failed !")
-                    }
-                    self.set_loading_icon = self.is_loading_icon;
-
-                    if self.platform_info.restore_logo() {
-                        self.last_restore_logo = 1;
-                        println!("Restore Logo Success!")
-                    }
-                    else {
-                        self.last_restore_logo = -1;
-                        println!("Restore Logo Failed!")
-                    }
-                    self.is_support = self.platform_info.get_info();
-                }
-                match self.last_restore_logo {
-                    1 => {
-                        ui.colored_label(Color32::LIGHT_GREEN, if self.language == "zh" {
-                            "恢复Logo成功"
-                        }
-                        else {
-                            "Restore Logo Success"
-                        });
-                    },
-                    -1 => {
-                        ui.colored_label(Color32::LIGHT_RED, if self.language == "zh" {
-                            "恢复Logo失败"
-                        }
-                        else {
-                            "Restore Logo Failed"
-                        });
-                    },
-                    _ => {}
-                }
-
-                ui.separator();
-
-                ui.allocate_space(egui::vec2(0.0, (ui.available_height() - 18.0).max(0.0)));
-                ui.vertical_centered(|ui| {
-                    use egui::special_emojis::GITHUB;
-                    ui.label(RichText::new(
-                        format!("{GITHUB} @chnzzh | MIT License")
-                    ).text_style(egui::TextStyle::Small)) //.on_hover_text("https://github.com/chnzzh/lenovo-logo-changer");
-                });
-            }
-            else {
-                ui.label(if self.language == "zh" {
-                    "不支持您的设备！"
-                }
-                else {
-                    "Your device is not supported !"
-                });
-            }});
-        }
-
-    fn show_admin_prompt_ui(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("You need to run this program as Administrator !");
-            ui.add_space(10.0);
-            ui.label("您需要以管理员权限运行此程序！");
-        });
-    }
-
 }
 
-fn setup_custom_fonts(ctx: &egui::Context) {
-    // Start with the default fonts (we will be adding to them rather than replacing them).
-    let mut fonts = egui::FontDefinitions::default();
+impl PlatformInfo {
+    pub fn get_info(&mut self) -> bool {
+        let varman = efivar::system();
+        let esp_var = Variable::from_str("LBLDESP-871455D0-5576-4FB8-9865-AF0824463B9E").unwrap();
+        match varman.read(&esp_var) {
+            Ok((buffer, _)) => {
+                if buffer.len() != 10 {
+                    return false;
+                }
+                self.enable = buffer[0];
+                self.width = u32::from_le_bytes(buffer[1..5].try_into().unwrap());
+                self.height = u32::from_le_bytes(buffer[5..9].try_into().unwrap());
+                self.support = Self::support_format(buffer[9]);
+                self.lbldesp_var = buffer.try_into().unwrap();
+            }
+            Err(_) => return false,
+        }
 
-    // Install my own assets (maybe supporting non-latin characters).
-    // .ttf and .otf files supported.
-    let font = std::fs::read("C:/Windows/Fonts/msyh.ttc").unwrap();
+        let dvc_var = Variable::from_str("LBLDVC-871455D1-5576-4FB8-9865-AF0824463C9F").unwrap();
+        match varman.read(&dvc_var) {
+            Ok((buffer, _)) => {
+                if buffer.len() != 40 {
+                    return false;
+                }
+                self.version = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
+                self.lbldvc_var = buffer.try_into().unwrap();
+            }
+            Err(_) => return false,
+        }
 
-    fonts.font_data.insert(
-        "my_font".to_owned(),
-        std::sync::Arc::new(FontData::from_owned(font)),
-    );
+        true
+    }
 
-    fonts.families.get_mut(&Proportional).unwrap()
-        .insert(0, "my_font".to_owned());
+    pub fn set_logo(&mut self, img_path: &String) -> bool {
+        let file_path = Path::new(img_path);
+        let ext = file_path.extension().unwrap().to_str().unwrap();
+        let dst = format!("EFI/Lenovo/Logo/mylogo_{}x{}.{}", self.width, self.height, ext);
 
-    fonts.families.get_mut(&egui::FontFamily::Monospace).unwrap()
-        .insert(0, "my_font".to_owned());
+        if !copy_file_to_esp(img_path, &dst) {
+            return false;
+        }
 
-    ctx.set_fonts(fonts);
+        let mut varman = efivar::system();
+        let mut buffer = self.lbldesp_var;
+        buffer[0] = 1;
+        let var = Variable::from_str("LBLDESP-871455D0-5576-4FB8-9865-AF0824463B9E").unwrap();
+        if varman.write(&var, VariableFlags::from_bits(0x7).unwrap(), &buffer).is_err() {
+            return false;
+        }
+        self.lbldesp_var = buffer;
+        self.enable = 1;
 
-    let mut style = (*ctx.style()).clone();
-    style.text_styles = [
-        (Heading, FontId::new(30.0, Proportional)),
-        (Body, FontId::new(18.0, Proportional)),
-        (Monospace, FontId::new(18.0, Proportional)),
-        (Button, FontId::new(18.0, Proportional)),
-        (Small, FontId::new(15.0, Proportional)),
-    ].into();
-    ctx.set_style(style);
+        let sha256 = match calculate_sha256(img_path) {
+            Ok(s) => hex::decode(s).unwrap(),
+            Err(_) => return false,
+        };
+        let mut dvc_buf = self.lbldvc_var;
+        dvc_buf[4..36].copy_from_slice(&sha256);
+        let var = Variable::from_str("LBLDVC-871455D1-5576-4FB8-9865-AF0824463C9F").unwrap();
+        if varman.write(&var, VariableFlags::from_bits(0x7).unwrap(), &dvc_buf).is_err() {
+            return false;
+        }
+        self.lbldvc_var = dvc_buf;
+        true
+    }
+
+    pub fn restore_logo(&mut self) -> bool {
+        let mut success = true;
+
+        if !delete_logo_path() {
+            success = false;
+        }
+
+        let mut varman = efivar::system();
+        if self.lbldesp_var[0] != 0 {
+            let mut buffer = self.lbldesp_var;
+            buffer[0] = 0;
+            let var = Variable::from_str("LBLDESP-871455D0-5576-4FB8-9865-AF0824463B9E").unwrap();
+            if varman.write(&var, VariableFlags::from_bits(0x7).unwrap(), &buffer).is_err() {
+                success = false;
+            } else {
+                self.lbldesp_var = buffer;
+                self.enable = 0;
+            }
+        }
+
+        if self.lbldvc_var[4..40] != [0u8; 36] {
+            let mut buffer = self.lbldvc_var;
+            buffer[4..40].copy_from_slice(&[0u8; 36]);
+            let var = Variable::from_str("LBLDVC-871455D1-5576-4FB8-9865-AF0824463C9F").unwrap();
+            if varman.write(&var, VariableFlags::from_bits(0x7).unwrap(), &buffer).is_err() {
+                success = false;
+            } else {
+                self.lbldvc_var = buffer;
+            }
+        }
+
+        success
+    }
+
+    pub fn get_loading_icon(&self) -> bool {
+        let output = Command::new("bcdedit")
+            .args(["/enum", "all"])
+            .show_window(0u16)
+            .output();
+
+        match output {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                !s.lines().any(|line| line.contains("bootuxdisabled") && line.contains("Yes"))
+            }
+            Err(_) => true,
+        }
+    }
+
+    pub fn set_loading_icon(&self, show: bool) -> bool {
+        let args = if show {
+            vec!["-set", "bootuxdisabled", "off"]
+        } else {
+            vec!["-set", "bootuxdisabled", "on"]
+        };
+
+        match Command::new("bcdedit")
+            .args(&args)
+            .show_window(0u16)
+            .output()
+        {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        }
+    }
+
+    fn support_format(flag: u8) -> Vec<&'static str> {
+        let mut out = vec![];
+        if flag & 0x01 != 0 { out.push("jpg"); }
+        if flag & 0x02 != 0 { out.push("tga"); }
+        if flag & 0x04 != 0 { out.push("pcx"); }
+        if flag & 0x08 != 0 { out.push("gif"); }
+        if flag & 0x10 != 0 { out.push("bmp"); }
+        if flag & 0x20 != 0 { out.push("png"); }
+        out
+    }
 }
